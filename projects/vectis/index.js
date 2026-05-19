@@ -1,37 +1,26 @@
-const { PublicKey } = require("@solana/web3.js");
-const { getTokenMintFromMarketIndex, processSpotPosition, processPerpPosition, getPerpTokenMintFromMarketIndex, getVaultPublicKey } = require("./spotMarkets");
-const { deserializeUserPositions } = require("./helpers");
+const { getTokenMintFromMarketIndex, processSpotPosition, processPerpPosition, getPerpTokenMintFromMarketIndex, getVaultPublicKey, DRIFT_VAULT_PROGRAM_ID, VOLTR_PROGRAM_ID, CUSTOM_PROGRAM_ID } = require("./spotMarkets");
+const { deserializeUserPositions, fetchVaultUserAddressesWithOffset, fetchVaultAddresses, fetchPositionAddresses} = require("./helpers");
 const { getPerpMarketFundingRates } = require("./spotMarkets");
-const { getMultipleAccounts } = require('../helper/solana')
-
+const { getMultipleAccounts, getProvider, getAssociatedTokenAddress, sumTokens2} = require('../helper/solana');
+const { Program } = require("@coral-xyz/anchor");
+const { Program : ProgramSerum } = require("@project-serum/anchor");
+const voltrIdl = require("./voltr-idl");
+const { PublicKey } = require("@solana/web3.js");
+const { JLP_MINT, JUP_PERP_PROGRAM_ID } = require("./constant");
+const ADDRESSES = require('../helper/coreAssets.json')
+const { post } = require('../helper/http');
 
 module.exports = {
   timetravel: false,
+  hallmarks: [
+    ["2026-04-01", "Drift hack"]
+  ],
   doublecounted: true,
   methodology: "Calculate sum of spot positions in vaults with unrealized profit and loss",
   solana: {
     tvl,
   },
 };
-
-const vaultUserAddresses = [
-  new PublicKey("9Zmn9v5A2YWUQj47bkEmcnc37ZsYe83rsRK8VV2j1UqX"), //Vault A
-  new PublicKey("4KvPuh1wG8j1pLnZUC5CuqTm2a41PWNtik1NwpLoRquE"), //Vault B
-  new PublicKey("Hcs63usAc6cxWccycrVwx1mrNgNSpUZaUgFm7Lw9tSkR"), //Vault C
-  new PublicKey("ARLwHJ3CYLkVTeW3nHvPBmGQ7SLQdhZbAkWHzYrq57rt"), //Vault D
-  new PublicKey("FyH3qGRQSG7AmdEsPEVDxdJJLnLhAn3CZ48acQU34LFr"), //Vault E
-  new PublicKey("MzEPFp2LwCSMMPHLQsqfE7SN6xkPHZ8Uym2HfrH7g5P"), //Yield Compass A
-  new PublicKey("CMiyE7M98DSPBEhQGTA6CzNodWkNuuW4y9HoocfK75nG"), //Yield Compass B
-  new PublicKey("CnaXXuzc2S5UFSGoBRuKVNnzXBvxbaMwq6hZu5m91CAV"),//LST Yield Compass
-  new PublicKey("Fwfu73gfD5KzqtSAVKqmW414rshmYpoHY4nJ8LWqPyHB"), //Prime standard
-  new PublicKey("6NaF3EpArzHJ4x5GeTzjcUcdic29Rt4sy4pn6LP7iJ4r"), //Prime A
-  new PublicKey("3CTgSqfQPWsFCjQmJx45JgVWgqEWau5ec55tsQDxW8gM"), // Prime B
-  new PublicKey("3BWfL6sGXMhLZaSbj5D7DYy2tFrjxV7gBdyrnVbcKnEi"), // Prime C
-  new PublicKey("2XnEYxNovTmYDXkDb7zninKttt3j9i67sj96H7CV5wZw"), // JLP Navigator II
-  
-
-
-];
 /**
  * Vault Equity Calculation Formula:
  * VaultEquity = NetSpotValue + UnrealizedPnL
@@ -50,67 +39,55 @@ const vaultUserAddresses = [
  * 
  */
 async function tvl(api) {
-  // Get all vault accounts first
-  const accounts = await getMultipleAccounts(vaultUserAddresses)
-  const deserializedData = accounts.map(deserializeUserPositions)
+  const [vaultAddresses, positionAddresses] = await Promise.all([
+    fetchVaultAddresses(), 
+    fetchPositionAddresses()
+  ]);
+  const voltrVaultAddresses = vaultAddresses.filter(vault => vault.programId === VOLTR_PROGRAM_ID.toBase58());
 
-  // Collect unique market indices upfront
-  const allSpotIndices = new Set()
-  const allPerpIndices = new Set()
-  
-  deserializedData.forEach(({ spotPositions, perpPositions }) => {
-    spotPositions?.forEach(pos => allSpotIndices.add(pos.market_index))
-    perpPositions?.forEach(pos => allPerpIndices.add(pos.market_index))
+  // Drift vaults disabled - drift was hacked
+  // const driftUserAddresses = positionAddresses.drift ?? []
+  // const driftVaultAddresses = vaultAddresses.filter(vault => [DRIFT_VAULT_PROGRAM_ID.toBase58(), CUSTOM_PROGRAM_ID.toBase58()].includes(vault.programId) );
+  // const { vaultUserAddresses, } = await fetchVaultUserAddressesWithOffset(driftVaultAddresses, 168);
+  // const accounts = await getMultipleAccounts([...vaultUserAddresses, ...driftUserAddresses])
+  // ... drift position processing removed ...
+
+  // Voltr vaults
+  const provider = getProvider();
+  const voltrProgram = new Program(voltrIdl, provider);
+  const voltrVaults = await voltrProgram.account.vault.fetchMultiple(voltrVaultAddresses.map(vault => new PublicKey(vault.address)));
+
+  voltrVaults.forEach(vault => {
+    const mint = vault.asset.mint.toBase58();
+    const balance = vault.asset.totalValue;
+    api.add(mint, balance)
   })
 
-  // Batch fetch 
-  const allKeys = [
-    ...[...allSpotIndices].map(index => getVaultPublicKey('spot_market', index)),
-    ...[...allPerpIndices].map(index => getVaultPublicKey('perp_market', index))
-  ]
-  
-  const allAccounts = await getMultipleAccounts(allKeys)
-  
-  // Create lookup maps
-  const spotAccountMap = {}
-  const perpAccountMap = {}
-  
-  let offset = 0
-  ;[...allSpotIndices].forEach((index, i) => {
-    spotAccountMap[index] = allAccounts[i]
-    offset = i + 1
-  })
-  ;[...allPerpIndices].forEach((index, i) => {
-    perpAccountMap[index] = allAccounts[i + offset]
-  })
+  // HyperLoop Prime A
+  const idl = await ProgramSerum.fetchIdl(JUP_PERP_PROGRAM_ID, provider);
+  const program = new ProgramSerum(idl, JUP_PERP_PROGRAM_ID, provider);
+  const jupiterAccounts = await program.account["borrowPosition"].fetchMultiple(
+    positionAddresses.jupiter
+  );
+  for (const account of jupiterAccounts) {
+    api.add(JLP_MINT, account.lockedCollateral);
+    const BORROW_SIZE_PRECISION = 1000;
+    api.add(ADDRESSES.solana.USDC, -account.borrowSize / BORROW_SIZE_PRECISION);
+  }
 
-  // Process positions using the cached account data
-  for (const { spotPositions, perpPositions } of deserializedData) {
-    if (spotPositions?.length) {
-      spotPositions.forEach(position => {
-        const tokenMint = getTokenMintFromMarketIndex(position.market_index)
-        const adjustedBalance = processSpotPosition(position, spotAccountMap[position.market_index])
-        api.add(tokenMint, adjustedBalance)
-      })
-    }
+  const tokenAccounts = positionAddresses.solana.map((address) =>
+    getAssociatedTokenAddress(ADDRESSES.solana.USDC, address)
+  );
+  await sumTokens2({ tokenAccounts, api });
 
-    if (perpPositions?.length) {
-      perpPositions.map(position => {
-        const baseTokenMint = getPerpTokenMintFromMarketIndex(position.market_index)
-        const { baseBalance, quoteBalance } = processPerpPosition(position)
-        api.add(baseTokenMint, baseBalance)
 
-        const quoteTokenMint = getTokenMintFromMarketIndex(0)
-        api.add(quoteTokenMint, quoteBalance)
-
-        const { cumulativeFundingRateLong, cumulativeFundingRateShort } = getPerpMarketFundingRates(perpAccountMap[position.market_index])
-        const currentCumulativeFundingRate = position.base_asset_amount > 0n ? cumulativeFundingRateLong : cumulativeFundingRateShort
-        const difference = (currentCumulativeFundingRate - BigInt(position.last_cumulative_funding_rate)) / BigInt(10 ** 6)
-        const fundingRatePnl = (difference * (position.base_asset_amount) / BigInt(10 ** 6))
-
-        api.add(quoteTokenMint, fundingRatePnl)
-      })
-    }
+  for (const address of positionAddresses.hyperliquid) {
+    let hyperliquidData = await post("https://api.hyperliquid.xyz/info", {
+      type: "clearinghouseState",
+      user: address,
+    });
+    hyperliquidData = parseInt(hyperliquidData.marginSummary.accountValue);
+    api.addCGToken("usd-coin", hyperliquidData);
   }
 }
 
